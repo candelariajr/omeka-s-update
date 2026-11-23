@@ -5,13 +5,15 @@
 # command it uses is `sudo systemctl reload php-fpm`. Run each phase in order and
 # read its output before the next one:
 #
-#   bash omeka-s-update.sh check      # 1.   read-only pre-flight
-#   bash omeka-s-update.sh prepare    # 2-4. back up DB, stage 4.2.1, update modules (live site untouched)
-#   bash omeka-s-update.sh swap       # 5.   put 4.2.1 live, then do the browser steps it prints
-#   bash omeka-s-update.sh rollback   #      only if needed
-#   bash omeka-s-update.sh cleanup    #      after a week or so
+#   bash update.sh check      # 1.   read-only pre-flight
+#   bash update.sh prepare    # 2-4. back up DB, stage 4.2.1, update modules (live site untouched)
+#   bash update.sh swap       # 5.   put 4.2.1 live, then do the browser steps it prints
+#   bash update.sh rollback   #      only if needed
+#   bash update.sh cleanup    #      after a week or so
 #
-# Settings can also come from the environment, e.g. OMEKA=/var/www/omeka-s bash omeka-s-update.sh check
+# Settings can also come from the environment, e.g. OMEKA=/var/www/omeka-s bash update.sh check
+# Edits to Omeka's own files are lost in the upgrade; keep them in a theme instead
+# (themes/<theme>/view/...). 'check' lists them; ALLOW_CORE_CHANGES=yes accepts the loss.
 # For a later Omeka S release, change VERSION and ZIP_SHA256 (sha256sum of the release zip).
 # Needs bash, php (CLI), curl, unzip, mysqldump/mysql; git to update modules.
 
@@ -26,6 +28,7 @@ ZIP_SHA256=cc27d1c7aca0209523d19aa285f4a08e29e34950dcc446951a7c1311de348e82
 MIN_PHP=8.1                         # Omeka S 4.2 needs PHP 8.1 or newer
 MODULE_ORG=${MODULE_ORG:-https://github.com/omeka-s-modules}   # official modules, updated automatically
 ALLOW_INCOMPATIBLE=${ALLOW_INCOMPATIBLE:-no}   # yes = go ahead even if an installed module won't load on $VERSION
+ALLOW_CORE_CHANGES=${ALLOW_CORE_CHANGES:-no}   # yes = go ahead even though local edits to core files will be dropped
 
 # Work folder. It must be on the same filesystem as the site so the swap is only
 # renames. By default it sits inside the web root, closed off with a deny-all
@@ -129,6 +132,65 @@ find_update() {
     echo "$v $got"; return 0
   done
   return 1
+}
+
+# core_changes STOCK_DIR "USED_THEMES": list files in the core code that differ from
+# (or aren't in) the stock release the site runs. The swap replaces all of them with
+# stock files, so a change survives only if every theme a site uses overrides that
+# template (themes/<theme>/view/...). Returns 1 if anything would be lost.
+core_changes() {
+  local stock=$1 used=$2 w f rel tpl t what lost=0 n=0 miss
+  w=$(work_name)
+  while IFS= read -r f; do
+    rel=${f#"$OMEKA"/}
+    if [ -f "$stock/$rel" ]; then
+      cmp -s "$stock/$rel" "$f" && continue
+      what="changed"
+    else
+      [[ $rel == */* ]] || continue          # extra file at the top: carried over
+      what="added  "
+    fi
+    n=$((n + 1))
+    if [[ $rel == application/view/* ]]; then
+      tpl=${rel#application/view/}; miss=
+      for t in $used; do [ -f "$OMEKA/themes/$t/view/$tpl" ] || miss+=" $t"; done
+      if [ -n "${used// /}" ] && [ -z "$miss" ]; then
+        echo "covered $what $rel  (overridden by$(for t in $used; do printf ' themes/%s/view/%s' "$t" "$tpl"; done))"
+        continue
+      fi
+      if [ -n "$miss" ]; then
+        echo "LOST    $what $rel  (to keep it, copy it to:$(for t in $miss; do printf ' themes/%s/view/%s' "$t" "$tpl"; done))"
+      else
+        echo "LOST    $what $rel  (no site uses a theme, so nothing overrides it)"
+      fi
+    else
+      echo "LOST    $what $rel"
+    fi
+    lost=1
+  done < <(find "$OMEKA" -mindepth 1 \( -path "$OMEKA/files" -o -path "$OMEKA/logs" -o -path "$OMEKA/modules" \
+             -o -path "$OMEKA/themes" -o -path "$OMEKA/config" -o -path "$OMEKA/.htaccess" ${w:+-o -path "$OMEKA/$w"} \) -prune \
+             -o -type f -print | sort)
+  # The bundled theme(s) get replaced too
+  for f in "$stock"/themes/*/; do
+    t=$(basename "$f")
+    [ -d "$OMEKA/themes/$t" ] || continue
+    while IFS= read -r rel; do
+      n=$((n + 1)); lost=1
+      echo "LOST    bundled theme: themes/$t/$rel  (copy the theme under a new name to keep it)"
+    done < <(cd "$OMEKA/themes/$t" && find . -type f | sed 's#^\./##' | sort | while IFS= read -r x; do
+               cmp -s "$x" "$f/$x" || echo "$x"; done)
+  done
+  [ $n = 0 ] && echo "none"
+  if [ $lost = 1 ]; then
+    if [ "$ALLOW_CORE_CHANGES" = yes ]; then
+      echo "ALLOW_CORE_CHANGES=yes: going ahead; the LOST changes above won't be in $VERSION"
+    else
+      echo "The upgrade would drop the LOST changes above. Move them out of core (a theme override,"
+      echo "or config/local.config.php), or rerun with ALLOW_CORE_CHANGES=yes to drop them."
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # stage_release DIR: download, verify and unpack $VERSION into DIR/omeka-s
@@ -236,21 +298,18 @@ run_checks() {
     else echo "unused  $c needs Omeka S $need (no site uses it)"; fi
   done
 
-  heading "Core files that differ from stock $oldv"
-  echo "(config/ and .htaccess move to the new version, robots.txt and other extra"
-  echo " files are copied, files/ and logs/ stay put; anything else here is a local edit to re-apply)"
-  mkdir -p "$tmpd/old" &&
-    curl -fsSL --retry 3 "https://github.com/omeka/omeka-s/releases/download/v$oldv/omeka-s-$oldv.zip" -o "$tmpd/old/s.zip" &&
-    unzip -q "$tmpd/old/s.zip" -d "$tmpd/old" &&
-    diff -rq -x files -x logs -x modules -x themes -x config -x .htaccess "$tmpd/old/omeka-s" "$OMEKA" |
-      grep -v "^Only in $OMEKA"
+  heading "Local changes to Omeka S's own files ($VERSION replaces these with stock files)"
+  echo "(config/ and .htaccess move to the new version, extra files directly in the site"
+  echo " folder like robots.txt are copied, files/ logs/ modules/ themes/ stay as they are)"
+  if mkdir -p "$tmpd/old" &&
+     curl -fsSL --retry 3 "https://github.com/omeka/omeka-s/releases/download/v$oldv/omeka-s-$oldv.zip" -o "$tmpd/old/s.zip" &&
+     unzip -q "$tmpd/old/s.zip" -d "$tmpd/old"; then
+    core_changes "$tmpd/old/omeka-s" "$used" || problems=1
+  else
+    echo "couldn't download stock $oldv to compare against"; problems=1
+  fi
   [ -f "$tmpd/old/omeka-s/.htaccess" ] && ! cmp -s "$tmpd/old/omeka-s/.htaccess" "$OMEKA/.htaccess" &&
-    echo "(.htaccess has local changes; they're kept, since the live .htaccess moves over)"
-  for d in "$tmpd/old/omeka-s/themes"/*/; do
-    c=$(basename "$d")
-    diff -rq "$d" "$OMEKA/themes/$c" >/dev/null 2>&1 ||
-      echo "bundled theme '$c' has local edits; $VERSION replaces it (copy it under a new name to keep them)"
-  done
+    echo "kept    .htaccess has local changes; the live .htaccess moves over as is"
 
   echo
   if [ "$problems" = 0 ]; then echo "Pre-flight OK."; else echo "Fix the items above before 'prepare'."; fi
@@ -433,5 +492,5 @@ cleanup() {
 
 case "$1" in
   check|prepare|swap|rollback|cleanup) "$1" ;;
-  *) sed -n '2,17p' "$0"; exit 1 ;;
+  *) sed -n '2,19p' "$0"; exit 1 ;;
 esac
